@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct ChunkProcessor {
     let sampleSource: AudioSampleSource
@@ -437,6 +438,8 @@ struct ChunkProcessor {
         )
 
         var chunkOutputs: [[TokenWindow]?] = []
+        // WhisperNotes fork: where each window sat, for the empty-window retry below.
+        var windowSpans: [EmptyWindowRetry.Span] = []
         var availableWorkers = Array(workers.indices)
         var inFlight = 0
         var chunkDecision = chunkStarts.first ?? ChunkStartDecision(start: 0, useWarmupPrefix: false)
@@ -494,6 +497,9 @@ struct ChunkProcessor {
                 let index = chunkIndex
                 let chunkStartOffset = warmupSamples > 0 ? contextStart : chunkStart
                 chunkOutputs.append(nil)
+                windowSpans.append(
+                    EmptyWindowRetry.Span(
+                        start: chunkStart, end: chunkEnd, isLast: isLastChunk, usedWarmupPrefix: warmupSamples > 0))
 
                 group.addTask {
                     var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
@@ -561,6 +567,17 @@ struct ChunkProcessor {
             while inFlight > 0 {
                 try Task.checkCancellation()
                 try await collectNextResult(&group)
+            }
+        }
+
+        // WhisperNotes fork: one shifted re-decode for a window that came back empty (#909).
+        if modelVersion == .v3 {
+            for index in chunkOutputs.indices where chunkOutputs[index]?.isEmpty == true {
+                guard let recovered = try await retryEmptyWindow(
+                    windowSpans[index], index: index, using: manager, decoderLayers: decoderLayers,
+                    melContextSamples: melContextSamples, maxModelSamples: maxModelSamples, language: language)
+                else { continue }
+                chunkOutputs[index] = recovered
             }
         }
 
@@ -952,5 +969,114 @@ struct ChunkProcessor {
             }
         }
         return Array(left[..<leftEnd]) + Array(right[rightStart...])
+    }
+}
+
+// MARK: - WhisperNotes fork: empty-window retry (backport of the idea in upstream #909/#910)
+
+/// Parakeet TDT v3 has input cuts on which it emits nothing at all: from a fresh decoder
+/// state the joint predicts blank for the whole 14.88 s window, although the window holds
+/// clear speech (upstream issue #909; the fp16 MLX port blanks on the same cuts, so it is
+/// the model, not CoreML). In 0.15.4 such a window merges as nothing and ~11 s of speech
+/// vanish silently (WhisperNotes WN-378). Moving the cut by a fraction of a second flips
+/// it back.
+///
+/// Upstream fixed it in 0.15.8 (PR #910) with a ladder of up to five length perturbations
+/// inside `executeMLInferenceWithTimings`. This fork keeps upstream's gates but makes
+/// exactly ONE extra decode per empty window, with the cut moved:
+/// - only after the window decoded to no tokens at all, so a window with any output is
+///   never touched and files without an empty window are byte-identical to 0.15.4;
+/// - only for v3-contract models, non-final windows on the regular (mel-context) path,
+///   whose own audio is not silence (RMS ≥ 0.003 ≈ −50 dBFS, upstream's gate);
+/// - the retry is kept only when credible (≥ 2 tokens at mean confidence ≥ 0.7, upstream's
+///   gate), otherwise the window stays empty as before.
+/// A later window is re-decoded 0.96 s earlier, same length: it then starts 2.96 s before
+/// the previous window ends and ends 1.04 s after the next one starts, its tokens carry
+/// global timestamps, and the usual `mergeChunks` stitches it in. Window 0 cannot move
+/// earlier, so its end is cut 0.48 s instead (that tail is inside window 1 as well). The
+/// final window is not retried: moving its cut would lose audio.
+/// Measured on Parakeet Ultra (WN-378, docs/release-1.9.3/2026-10-26/WN-378-FIX.md):
+/// −0.96 s recovered 16/16 empty speech windows (ANE), 18/19 (CPU) and 16/16 with the v3
+/// weights, −0.48 s 13/16, 13/19, 15/16; for window 0 a 0.48 s cut recovered 16/28 and a
+/// 0.96 s cut 17/28 but accepted one hallucination on a music intro, the 0.48 s cut none.
+enum EmptyWindowRetry {
+    struct Span {
+        let start: Int
+        let end: Int
+        let isLast: Bool
+        let usedWarmupPrefix: Bool
+    }
+
+    /// Frame-aligned (timestamps stay exact): 12 encoder frames = 0.96 s, 6 = 0.48 s.
+    static let shiftSamples = 12 * ASRConstants.samplesPerEncoderFrame
+    static let firstWindowTrimSamples = 6 * ASRConstants.samplesPerEncoderFrame
+    /// Public-privacy log (numbers only, no transcript text), so the lines stay readable in
+    /// device syslog: subsystem com.fluidinference, category EmptyWindowRetry.
+    static let log = Logger(subsystem: AppLogger.defaultSubsystem, category: "EmptyWindowRetry")
+    static let minimumRMS: Float = 0.003
+    static let minimumTokens = 2
+    static let minimumMeanConfidence: Float = 0.7
+
+    static func isCredible(_ confidences: [Float]) -> Bool {
+        guard confidences.count >= minimumTokens else { return false }
+        return confidences.reduce(0, +) / Float(confidences.count) >= minimumMeanConfidence
+    }
+}
+
+extension ChunkProcessor {
+    /// The tokens of one shifted re-decode of an empty window, or nil when the window does
+    /// not qualify or the retry is not credible (the window then stays empty).
+    fileprivate func retryEmptyWindow(
+        _ span: EmptyWindowRetry.Span,
+        index: Int,
+        using manager: AsrManager,
+        decoderLayers: Int,
+        melContextSamples: Int,
+        maxModelSamples: Int,
+        language: Language?
+    ) async throws -> [TokenWindow]? {
+        guard !span.isLast, !span.usedWarmupPrefix, span.end > span.start else { return nil }
+        let rms: Float = try {
+            let own = try readSamples(offset: span.start, count: span.end - span.start)
+            var energy: Float = 0
+            for sample in own { energy += sample * sample }
+            return (energy / Float(own.count)).squareRoot()
+        }()
+        let seconds = { (samples: Int) in String(format: "%.2f", Double(samples) / Double(ASRConstants.sampleRate)) }
+        guard rms >= EmptyWindowRetry.minimumRMS else {
+            let message = "empty window \(index) (\(seconds(span.start))–\(seconds(span.end)) s) is silence (rms \(String(format: "%.4f", rms))): no retry"
+            EmptyWindowRetry.log.notice("\(message, privacy: .public)")
+            return nil
+        }
+        try Task.checkCancellation()
+
+        let retryStart = index > 0 ? span.start - EmptyWindowRetry.shiftSamples : 0
+        let retryEnd = span.end - (index > 0 ? EmptyWindowRetry.shiftSamples : EmptyWindowRetry.firstWindowTrimSamples)
+        let contextSamples = index > 0 ? min(melContextSamples, retryStart) : 0
+        let samples = try readSamples(offset: retryStart - contextSamples, count: retryEnd - retryStart + contextSamples)
+        var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+        decoderState.reset()
+        let (tokens, timestamps, confidences, durations) = try await Self.transcribeChunk(
+            samples: samples,
+            contextSamples: contextSamples,
+            chunkStart: retryStart,
+            isLastChunk: false,
+            using: manager,
+            decoderState: &decoderState,
+            maxModelSamples: maxModelSamples,
+            language: language
+        )
+        let credible =
+            tokens.count == timestamps.count && tokens.count == confidences.count
+            && EmptyWindowRetry.isCredible(confidences)
+        let meanConfidence = confidences.isEmpty ? 0 : confidences.reduce(0, +) / Float(confidences.count)
+        let message =
+            "empty window \(index) (\(seconds(span.start))–\(seconds(span.end)) s, rms \(String(format: "%.4f", rms))) retried at \(seconds(retryStart))–\(seconds(retryEnd)) s: \(tokens.count) tokens, mean confidence \(String(format: "%.2f", meanConfidence)) → \(credible ? "kept" : "discarded")"
+        EmptyWindowRetry.log.notice("\(message, privacy: .public)")
+        guard credible else { return nil }
+        let safeDurations = durations.count == tokens.count ? durations : Array(repeating: 0, count: tokens.count)
+        return tokens.indices.map {
+            (token: tokens[$0], timestamp: timestamps[$0], confidence: confidences[$0], duration: safeDurations[$0])
+        }
     }
 }
